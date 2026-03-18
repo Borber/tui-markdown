@@ -37,6 +37,11 @@ pub trait StyleSheet: Clone + Send + Sync + 'static {
 
     /// Style for metadata blocks (front matter).
     fn metadata_block(&self) -> Style;
+
+    /// Style for table header cell content.
+    fn table_header(&self) -> Style {
+        Style::new().bold()
+    }
 }
 
 /// The default style set
@@ -86,5 +91,9 @@ impl StyleSheet for DefaultStyleSheet {
 
     fn metadata_block(&self) -> Style {
         Style::new().light_yellow()
+    }
+
+    fn table_header(&self) -> Style {
+        Style::new().cyan().bold()
     }
 }

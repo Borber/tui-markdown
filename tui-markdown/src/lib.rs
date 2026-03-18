@@ -30,6 +30,7 @@
 //! # }
 //! ~~~
 
+#[cfg(feature = "highlight-code")]
 use std::sync::LazyLock;
 use std::vec;
 
@@ -37,8 +38,8 @@ use std::vec;
 use ansi_to_tui::IntoText;
 use itertools::{Itertools, Position};
 use pulldown_cmark::{
-    BlockQuoteKind, CodeBlockKind, CowStr, Event, HeadingLevel, Options as ParseOptions, Parser,
-    Tag, TagEnd,
+    Alignment, BlockQuoteKind, CodeBlockKind, CowStr, Event, HeadingLevel, Options as ParseOptions,
+    Parser, Tag, TagEnd,
 };
 use ratatui_core::style::{Style, Stylize};
 use ratatui_core::text::{Line, Span, Text};
@@ -50,6 +51,7 @@ use syntect::{
     util::{as_24_bit_terminal_escaped, LinesWithEndings},
 };
 use tracing::{debug, instrument, warn};
+use unicode_width::UnicodeWidthChar;
 
 pub use crate::options::Options;
 pub use crate::style_sheet::{DefaultStyleSheet, StyleSheet};
@@ -84,6 +86,7 @@ where
 {
     let mut parse_opts = ParseOptions::empty();
     parse_opts.insert(ParseOptions::ENABLE_STRIKETHROUGH);
+    parse_opts.insert(ParseOptions::ENABLE_TABLES);
     parse_opts.insert(ParseOptions::ENABLE_TASKLISTS);
     parse_opts.insert(ParseOptions::ENABLE_HEADING_ATTRIBUTES);
     parse_opts.insert(ParseOptions::ENABLE_YAML_STYLE_METADATA_BLOCKS);
@@ -142,6 +145,195 @@ impl<'a> HeadingMeta<'a> {
     }
 }
 
+#[derive(Default)]
+struct TableCell<'a> {
+    spans: Vec<Span<'a>>,
+}
+
+#[derive(Default)]
+struct TableRow<'a> {
+    cells: Vec<TableCell<'a>>,
+    is_header: bool,
+}
+
+#[derive(Default)]
+struct TableState<'a> {
+    alignments: Vec<Alignment>,
+    rows: Vec<TableRow<'a>>,
+    current_row: Option<TableRow<'a>>,
+    current_cell: Option<TableCell<'a>>,
+    in_head: bool,
+}
+
+impl<'a> TableState<'a> {
+    fn new(alignments: Vec<Alignment>) -> Self {
+        Self {
+            alignments,
+            ..Self::default()
+        }
+    }
+
+    fn start_head(&mut self) {
+        self.in_head = true;
+    }
+
+    fn end_head(&mut self) {
+        self.end_row();
+        self.in_head = false;
+    }
+
+    fn start_row(&mut self) {
+        self.current_row = Some(TableRow {
+            is_header: self.in_head,
+            ..TableRow::default()
+        });
+    }
+
+    fn end_row(&mut self) {
+        self.end_cell();
+        if let Some(row) = self.current_row.take() {
+            self.rows.push(row);
+        }
+    }
+
+    fn start_cell(&mut self) {
+        if self.current_row.is_none() {
+            self.start_row();
+        }
+        self.current_cell = Some(TableCell::default());
+    }
+
+    fn end_cell(&mut self) {
+        let Some(cell) = self.current_cell.take() else {
+            return;
+        };
+        if let Some(row) = self.current_row.as_mut() {
+            row.cells.push(cell);
+        }
+    }
+
+    fn push_span(&mut self, span: Span<'a>) {
+        if let Some(cell) = self.current_cell.as_mut() {
+            cell.spans.push(span);
+        }
+    }
+
+    fn into_lines(self, header_style: Style) -> Vec<Line<'a>> {
+        let column_count = self.alignments.len().max(
+            self.rows
+                .iter()
+                .map(|row| row.cells.len())
+                .max()
+                .unwrap_or(0),
+        );
+
+        if column_count == 0 || self.rows.is_empty() {
+            return Vec::new();
+        }
+
+        let mut widths = vec![1; column_count];
+        for row in &self.rows {
+            for (column, cell) in row.cells.iter().enumerate() {
+                widths[column] = widths[column].max(display_width_spans(&cell.spans));
+            }
+        }
+
+        let mut lines = Vec::with_capacity(self.rows.len() * 2 + 1);
+        lines.push(build_table_border(&widths, "┌", "┬", "┐"));
+
+        for (index, row) in self.rows.iter().enumerate() {
+            lines.push(build_table_row(
+                row,
+                &self.alignments,
+                &widths,
+                header_style,
+            ));
+
+            if index + 1 < self.rows.len() {
+                lines.push(build_table_border(&widths, "├", "┼", "┤"));
+            }
+        }
+
+        lines.push(build_table_border(&widths, "└", "┴", "┘"));
+        lines
+    }
+}
+
+fn display_width(text: &str) -> usize {
+    text.chars()
+        .map(|ch| UnicodeWidthChar::width(ch).unwrap_or(0))
+        .sum()
+}
+
+fn display_width_spans(spans: &[Span<'_>]) -> usize {
+    spans
+        .iter()
+        .map(|span| display_width(span.content.as_ref()))
+        .sum()
+}
+
+fn build_table_border<'a>(
+    widths: &[usize],
+    left: &'static str,
+    mid: &'static str,
+    right: &'static str,
+) -> Line<'a> {
+    let mut spans = Vec::with_capacity(widths.len() * 2 + 1);
+    spans.push(Span::from(left));
+    for (index, width) in widths.iter().enumerate() {
+        spans.push(Span::from("─".repeat(*width + 2)));
+        spans.push(Span::from(if index + 1 == widths.len() {
+            right
+        } else {
+            mid
+        }));
+    }
+    Line::from(spans)
+}
+
+fn build_table_row<'a>(
+    row: &TableRow<'a>,
+    alignments: &[Alignment],
+    widths: &[usize],
+    header_style: Style,
+) -> Line<'a> {
+    let mut spans = Vec::with_capacity(widths.len() * 5 + 1);
+    spans.push(Span::from("│"));
+
+    for (index, width) in widths.iter().enumerate() {
+        let alignment = alignments.get(index).copied().unwrap_or(Alignment::None);
+        let (mut cell_spans, cell_width) = row
+            .cells
+            .get(index)
+            .map(|cell| (cell.spans.clone(), display_width_spans(&cell.spans)))
+            .unwrap_or_default();
+        if row.is_header {
+            for span in &mut cell_spans {
+                span.style = header_style.patch(span.style);
+            }
+        }
+        let remaining = width.saturating_sub(cell_width);
+        let (left_padding, right_padding) = match alignment {
+            Alignment::Right => (remaining, 0),
+            Alignment::Center => (remaining / 2, remaining - (remaining / 2)),
+            Alignment::None | Alignment::Left => (0, remaining),
+        };
+
+        spans.push(Span::from(" "));
+        if left_padding > 0 {
+            spans.push(Span::from(" ".repeat(left_padding)));
+        }
+        spans.append(&mut cell_spans);
+        if right_padding > 0 {
+            spans.push(Span::from(" ".repeat(right_padding)));
+        }
+        spans.push(Span::from(" "));
+        spans.push(Span::from("│"));
+    }
+
+    Line::from(spans)
+}
+
 struct TextWriter<'a, I, S: StyleSheet> {
     /// Iterator supplying events.
     iter: I,
@@ -184,6 +376,9 @@ struct TextWriter<'a, I, S: StyleSheet> {
 
     /// Track if we just added a list item bullet/number.
     just_added_list_item: bool,
+
+    /// Buffered table state. Tables need a full pass to compute column widths.
+    table: Option<TableState<'a>>,
 }
 
 #[cfg(feature = "highlight-code")]
@@ -212,6 +407,7 @@ where
             styles,
             heading_meta: None,
             in_metadata_block: false,
+            table: None,
         }
     }
 
@@ -256,10 +452,10 @@ where
             Tag::List(start_index) => self.start_list(start_index),
             Tag::Item => self.start_item(),
             Tag::FootnoteDefinition(_) => warn!("Footnote definition not yet supported"),
-            Tag::Table(_) => warn!("Table not yet supported"),
-            Tag::TableHead => warn!("Table head not yet supported"),
-            Tag::TableRow => warn!("Table row not yet supported"),
-            Tag::TableCell => warn!("Table cell not yet supported"),
+            Tag::Table(alignments) => self.start_table(alignments),
+            Tag::TableHead => self.start_table_head(),
+            Tag::TableRow => self.start_table_row(),
+            Tag::TableCell => self.start_table_cell(),
             Tag::Emphasis => self.push_inline_style(Style::new().italic()),
             Tag::Strong => self.push_inline_style(Style::new().bold()),
             Tag::Strikethrough => self.push_inline_style(Style::new().crossed_out()),
@@ -284,10 +480,10 @@ where
             TagEnd::List(_is_ordered) => self.end_list(),
             TagEnd::Item => {}
             TagEnd::FootnoteDefinition => {}
-            TagEnd::Table => {}
-            TagEnd::TableHead => {}
-            TagEnd::TableRow => {}
-            TagEnd::TableCell => {}
+            TagEnd::Table => self.end_table(),
+            TagEnd::TableHead => self.end_table_head(),
+            TagEnd::TableRow => self.end_table_row(),
+            TagEnd::TableCell => self.end_table_cell(),
             TagEnd::Emphasis => self.pop_inline_style(),
             TagEnd::Strong => self.pop_inline_style(),
             TagEnd::Strikethrough => self.pop_inline_style(),
@@ -363,6 +559,17 @@ where
     }
 
     fn text(&mut self, text: CowStr<'a>) {
+        if self.in_table_cell() {
+            let style = self.inline_styles.last().copied().unwrap_or_default();
+            let normalized = text.lines().join(" ");
+            if !normalized.is_empty() {
+                self.push_span(Span::styled(normalized, style));
+            }
+            self.needs_newline = false;
+            self.just_added_list_item = false;
+            return;
+        }
+
         #[cfg(feature = "highlight-code")]
         if let Some(highlighter) = &mut self.code_highlighter {
             let text: Text = LinesWithEndings::from(&text)
@@ -403,6 +610,10 @@ where
     }
 
     fn hard_break(&mut self) {
+        if self.in_table_cell() {
+            self.push_span(Span::raw(" "));
+            return;
+        }
         self.push_line(Line::default());
     }
 
@@ -484,11 +695,81 @@ where
     }
 
     fn soft_break(&mut self) {
+        if self.in_table_cell() {
+            self.push_span(Span::raw(" "));
+            return;
+        }
         if self.in_metadata_block {
             self.hard_break();
         } else {
             self.push_span(Span::raw(" "));
         }
+    }
+
+    fn start_table(&mut self, alignments: Vec<Alignment>) {
+        if self.needs_newline {
+            self.push_line(Line::default());
+        }
+        self.table = Some(TableState::new(alignments));
+        self.needs_newline = false;
+        self.just_added_list_item = false;
+    }
+
+    fn end_table(&mut self) {
+        if let Some(table) = self.table.as_mut() {
+            table.end_row();
+        }
+        let Some(table) = self.table.take() else {
+            return;
+        };
+        let header_style = self.styles.table_header();
+        for line in table.into_lines(header_style) {
+            self.push_line(line);
+        }
+        self.needs_newline = true;
+        self.just_added_list_item = false;
+    }
+
+    fn start_table_head(&mut self) {
+        if let Some(table) = self.table.as_mut() {
+            table.start_head();
+        }
+    }
+
+    fn end_table_head(&mut self) {
+        if let Some(table) = self.table.as_mut() {
+            table.end_head();
+        }
+    }
+
+    fn start_table_row(&mut self) {
+        if let Some(table) = self.table.as_mut() {
+            table.start_row();
+        }
+    }
+
+    fn end_table_row(&mut self) {
+        if let Some(table) = self.table.as_mut() {
+            table.end_row();
+        }
+    }
+
+    fn start_table_cell(&mut self) {
+        if let Some(table) = self.table.as_mut() {
+            table.start_cell();
+        }
+    }
+
+    fn end_table_cell(&mut self) {
+        if let Some(table) = self.table.as_mut() {
+            table.end_cell();
+        }
+    }
+
+    fn in_table_cell(&self) -> bool {
+        self.table
+            .as_ref()
+            .is_some_and(|table| table.current_cell.is_some())
     }
 
     fn start_codeblock(&mut self, kind: CodeBlockKind<'_>) {
@@ -575,6 +856,13 @@ where
 
     #[instrument(level = "trace", skip(self))]
     fn push_span(&mut self, span: Span<'a>) {
+        if let Some(table) = self.table.as_mut() {
+            if table.current_cell.is_some() {
+                table.push_span(span);
+                return;
+            }
+        }
+
         if let Some(line) = self.text.lines.last_mut() {
             line.push_span(span);
         } else {
